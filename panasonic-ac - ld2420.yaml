@@ -1,0 +1,562 @@
+esphome:
+  name: esphome-hub-ir-ac
+  friendly_name: Hub IR -AC- Tầng 2
+  min_version: 2026.4.0
+  name_add_mac_suffix: false
+  on_boot:
+    priority: 800
+    then:
+      - output.turn_on: led_blue   # vừa cấp điện là sáng xanh dương
+
+esp8266:
+  board: esp12e
+
+logger:
+  level: INFO          # đổi DEBUG khi cần soi log giải mã
+  baud_rate: 0         # nhường UART0 (GPIO1/GPIO3) cho LD2420; log vẫn xem qua WiFi
+
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  use_address: 192.168.88.153
+  power_save_mode: none        # ESP8266 giữ kết nối chắc hơn
+  reboot_timeout: 5min         # mất WiFi 5 phút -> tự khởi động lại
+  ap:
+    ssid: "ESPhome Config Wifi"
+    password: ""
+
+api:
+  reboot_timeout: 10min        # 10 phút không có HA kết nối -> tự khởi động lại
+
+captive_portal:
+
+# =====================================================================
+#  ĐÈN LED RGB (chung anode -> inverted)
+#  Đỏ      GPIO14 : sáng khi đang phát IR
+#  Xanh lá GPIO5  : chớp khi nhận IR
+#  Xanh dương GPIO4: khởi động sáng, nháy khi chưa có WiFi, có WiFi thì tắt
+# =====================================================================
+output:
+  - platform: gpio
+    id: led_red
+    pin:
+      number: GPIO14
+      inverted: true
+  - platform: gpio
+    id: led_green
+    pin:
+      number: GPIO5
+      inverted: true
+  - platform: gpio
+    id: led_blue
+    pin:
+      number: GPIO4
+      inverted: true
+
+interval:
+  - interval: 500ms
+    then:
+      - lambda: |-
+          static bool on = true;
+          if (wifi::global_wifi_component->is_connected()) {
+            id(led_blue).turn_off();
+            on = false;
+          } else if (millis() < 3000) {
+            id(led_blue).turn_on();
+          } else {
+            on = !on;
+            if (on) id(led_blue).turn_on(); else id(led_blue).turn_off();
+          }
+
+  # Còn người thì đèn đỏ chớp nhẹ theo thanh kéo "Chu kỳ nháy đèn có người"
+  # (chỉ khi công tắc "Đèn báo có người" đang bật)
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (!id(led_presence_en).state || !id(co_nguoi).state) {
+                id(blink_counter) = 0;
+                return false;
+              }
+              if (++id(blink_counter) < (uint32_t) id(blink_period).state) return false;
+              id(blink_counter) = 0;
+              return !id(blink_presence).is_running();
+          then:
+            - output.turn_on: led_red
+            - delay: 100ms
+            - output.turn_off: led_red
+
+# =====================================================================
+#  TRẠNG THÁI GÓI PANASONIC (27 byte) – dùng làm khuôn khi phát
+# =====================================================================
+globals:
+  - id: blink_counter        # đếm giây cho nháy đèn khi có người
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: pana_state
+    type: std::vector<uint8_t>
+    restore_value: false
+    initial_value: '{0x02,0x20,0xE0,0x04,0x00,0x00,0x00,0x06, 0x02,0x20,0xE0,0x04,0x00,0x39,0x38,0x80,0x45,0x00,0x00,0x0E,0xE0,0x00,0x00,0x89,0x00,0x00,0xB3}'
+  - id: swing_pos            # vị trí cánh cố định gần nhất (1..5)
+    type: uint8_t
+    restore_value: true
+    initial_value: '3'
+
+script:
+  - id: blink_rx
+    mode: restart
+    then:
+      - output.turn_on: led_green
+      - delay: 150ms
+      - output.turn_off: led_green
+
+  # Đèn đỏ nháy 3 lần khi LD2420 vừa phát hiện người
+  - id: blink_presence
+    mode: restart
+    then:
+      - repeat:
+          count: 3
+          then:
+            - output.turn_on: led_red
+            - delay: 150ms
+            - output.turn_off: led_red
+            - delay: 150ms
+
+  # Phát lệnh Panasonic đầy đủ (hỗ trợ 0.5°C) theo trạng thái thẻ điều hòa
+  - id: send_pana
+    mode: restart
+    then:
+      - delay: 150ms          # chờ thẻ điều hòa áp dụng lệnh từ HA
+      - remote_transmitter.transmit_raw:
+          transmitter_id: remote_transmitter_1
+          carrier_frequency: 36700Hz
+          code: !lambda |-
+            std::vector<uint8_t> b = id(pana_state);
+            auto *ac = id(dieu_hoa);
+
+            // --- Nguồn + chế độ (byte 13) ---
+            bool power = ac->mode != climate::CLIMATE_MODE_OFF;
+            uint8_t mode = b[13] >> 4;
+            switch (ac->mode) {
+              case climate::CLIMATE_MODE_HEAT_COOL:
+              case climate::CLIMATE_MODE_AUTO:     mode = 0; break;
+              case climate::CLIMATE_MODE_DRY:      mode = 2; break;
+              case climate::CLIMATE_MODE_COOL:     mode = 3; break;
+              case climate::CLIMATE_MODE_HEAT:     mode = 4; break;
+              case climate::CLIMATE_MODE_FAN_ONLY: mode = 6; break;
+              default: break;                       // OFF: giữ chế độ cũ
+            }
+            b[13] = (mode << 4) | (b[13] & 0x0E) | (power ? 1 : 0);
+
+            // --- Nhiệt độ (byte 14 = độ x2, bước 0.5°C) ---
+            float t = ac->target_temperature;
+            if (std::isnan(t)) t = 26;
+            if (t < 16) t = 16;
+            if (t > 30) t = 30;
+            b[14] = (uint8_t) lroundf(t * 2);
+
+            // --- Quạt + cánh dọc (byte 16) ---
+            uint8_t fan = b[16] >> 4;
+            if (ac->fan_mode.has_value()) {
+              switch (*ac->fan_mode) {
+                case climate::CLIMATE_FAN_AUTO:   fan = 0xA; break;
+                case climate::CLIMATE_FAN_LOW:    fan = 0x3; break;
+                case climate::CLIMATE_FAN_MEDIUM: fan = 0x5; break;
+                case climate::CLIMATE_FAN_HIGH:   fan = 0x7; break;
+                default: break;
+              }
+            }
+            uint8_t swg = (ac->swing_mode == climate::CLIMATE_SWING_OFF)
+                            ? id(swing_pos) : 0xF;
+            b[16] = (fan << 4) | swg;
+
+            // --- Checksum ---
+            uint8_t sum = 0;
+            for (int k = 8; k < 26; k++) sum += b[k];
+            b[26] = sum;
+            id(pana_state) = b;
+
+            ESP_LOGI("pana", "Phat: power=%d mode=%d temp=%.1f fan=0x%X swing=0x%X",
+                     power, mode, t, fan, swg);
+
+            // --- Dựng xung: frame 8 byte + gap + frame 19 byte, LSB trước ---
+            std::vector<int32_t> out;
+            auto add_byte = [&](uint8_t v) {
+              for (int k = 0; k < 8; k++) {
+                out.push_back(432);
+                out.push_back(((v >> k) & 1) ? -1296 : -432);
+              }
+            };
+            out.push_back(3456); out.push_back(-1728);
+            for (int k = 0; k < 8; k++) add_byte(b[k]);
+            out.push_back(432);  out.push_back(-10000);
+            out.push_back(3456); out.push_back(-1728);
+            for (int k = 8; k < 27; k++) add_byte(b[k]);
+            out.push_back(432);
+            return out;
+
+# =====================================================================
+#  CẢM BIẾN NHIỆT / ẨM
+# =====================================================================
+i2c:
+  - id: i2c_1
+    scl: 0
+    sda: 2
+
+sensor:
+  - platform: hdc1080
+    id: sensor_hdc1080_1
+    i2c_id: i2c_1
+    update_interval: 30s
+    humidity:
+      name: Humidity
+      id: sensor_hdc1080_1_humidity
+    temperature:
+      name: Temperature
+      id: sensor_hdc1080_1_temperature
+
+  - platform: ld2420
+    ld2420_id: radar
+    moving_distance:
+      name: "Khoảng cách người"
+
+# =====================================================================
+#  IR PHÁT / THU
+# =====================================================================
+remote_transmitter:
+  - id: remote_transmitter_1        # LED IR thật
+    pin: GPIO13
+    carrier_duty_percent: 50%
+    on_transmit:
+      - output.turn_on: led_red
+    on_complete:
+      - output.turn_off: led_red
+
+  - id: ir_dummy                     # chân giả cho heatpumpir (không nối gì)
+    pin: GPIO16
+    carrier_duty_percent: 50%
+
+remote_receiver:
+  - id: remote_receiver_1
+    pin:
+      number: GPIO12
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    buffer_size: 4kB
+    idle: 20ms
+    filter: 100us
+    tolerance: 30%
+    dump: []
+    on_raw:
+      then:
+        - lambda: |-
+            // Bỏ qua nhiễu: tín hiệu remote thật luôn có >= 20 xung
+            if (x.size() < 20) return;
+            id(blink_rx).execute();                    // đèn xanh lá chỉ chớp với tín hiệu thật
+            // ===== Giải mã remote Panasonic -> đồng bộ thẻ điều hòa =====
+            auto near = [](int32_t v, int32_t t) {
+              v = abs(v);
+              return v > t * 6 / 10 && v < t * 14 / 10;
+            };
+            std::vector<uint8_t> got;
+            size_t i = 0;
+            while (i + 1 < x.size()) {
+              if (near(x[i], 3500) && near(x[i + 1], 1750)) {
+                i += 2;
+                uint8_t cur = 0; int nbits = 0;
+                while (i + 1 < x.size() && near(x[i], 435)) {
+                  int32_t sp = abs(x[i + 1]);
+                  if (sp > 900 && sp < 1800)        cur |= (1 << nbits);
+                  else if (!(sp > 200 && sp < 750)) break;
+                  nbits++; i += 2;
+                  if (nbits == 8) { got.push_back(cur); cur = 0; nbits = 0; }
+                }
+              } else {
+                i++;
+              }
+            }
+            ESP_LOGD("pana", "Burst %u xung -> %u byte", (unsigned) x.size(), (unsigned) got.size());
+            if (got.empty()) return;
+
+            static std::vector<uint8_t> acc;
+            static uint32_t last_ms = 0;
+            if (millis() - last_ms > 300) acc.clear();
+            last_ms = millis();
+            acc.insert(acc.end(), got.begin(), got.end());
+            // Mất frame 1 (8 byte cố định) -> tự ghép
+            if (acc.size() == 19 && acc[0] == 0x02 && acc[1] == 0x20 && acc[2] == 0xE0 && acc[3] == 0x04) {
+              const uint8_t f1[8] = {0x02, 0x20, 0xE0, 0x04, 0x00, 0x00, 0x00, 0x06};
+              acc.insert(acc.begin(), f1, f1 + 8);
+            }
+            if (acc.size() < 27) return;
+
+            std::vector<uint8_t> b(acc.begin(), acc.begin() + 27);
+            acc.clear();
+            if (b[0] != 0x02 || b[1] != 0x20 || b[2] != 0xE0 || b[3] != 0x04) return;
+            uint8_t sum = 0;
+            for (int k = 8; k < 26; k++) sum += b[k];
+            if (sum != b[26]) { ESP_LOGW("pana", "Sai checksum"); return; }
+
+            bool power   = b[13] & 0x01;
+            uint8_t mode = b[13] >> 4;
+            float temp   = b[14] / 2.0f;
+            uint8_t fan  = b[16] >> 4;
+            uint8_t swg  = b[16] & 0x0F;
+            ESP_LOGI("pana", "Remote: power=%d mode=%d temp=%.1f fan=0x%X swing=0x%X",
+                     power, mode, temp, fan, swg);
+
+            id(pana_state) = b;                       // lưu làm khuôn cho lần phát sau
+            if (swg >= 1 && swg <= 5) id(swing_pos) = swg;
+
+            auto *ac = id(dieu_hoa);
+            if (!power) {
+              ac->mode = climate::CLIMATE_MODE_OFF;
+            } else {
+              switch (mode) {
+                case 0: ac->mode = climate::CLIMATE_MODE_HEAT_COOL; break;
+                case 2: ac->mode = climate::CLIMATE_MODE_DRY;       break;
+                case 3: ac->mode = climate::CLIMATE_MODE_COOL;      break;
+                case 4: ac->mode = climate::CLIMATE_MODE_HEAT;      break;
+                case 6: ac->mode = climate::CLIMATE_MODE_FAN_ONLY;  break;
+              }
+            }
+            if (temp >= 16 && temp <= 30) ac->target_temperature = temp;
+            if (fan == 0xA)              ac->fan_mode = climate::CLIMATE_FAN_AUTO;
+            else if (fan <= 4)           ac->fan_mode = climate::CLIMATE_FAN_LOW;
+            else if (fan == 5)           ac->fan_mode = climate::CLIMATE_FAN_MEDIUM;
+            else                         ac->fan_mode = climate::CLIMATE_FAN_HIGH;
+            ac->swing_mode = (swg == 0xF) ? climate::CLIMATE_SWING_VERTICAL
+                                          : climate::CLIMATE_SWING_OFF;
+            ac->publish_state();                      // chỉ cập nhật HA, không phát lại
+
+infrared:
+  - platform: ir_rf_proxy
+    name: IR Transmitter
+    remote_transmitter_id: remote_transmitter_1
+
+  - platform: ir_rf_proxy
+    name: IR Receiver
+    receiver_frequency: 38kHz
+    remote_receiver_id: remote_receiver_1
+
+# =====================================================================
+#  ĐIỀU HÒA
+#  heatpumpir chỉ dùng để tạo thẻ điều hòa trên HA (phát ra chân giả GPIO16).
+#  Lệnh thật do script send_pana phát qua GPIO13, hỗ trợ bước 0.5°C.
+# =====================================================================
+climate:
+  - platform: heatpumpir
+    id: dieu_hoa
+    name: "Điều hòa"
+    transmitter_id: ir_dummy
+    protocol: panasonic_dke
+    horizontal_default: middle
+    vertical_default: auto
+    min_temperature: 16
+    max_temperature: 30
+    sensor: sensor_hdc1080_1_temperature
+    visual:
+      temperature_step:
+        target_temperature: 0.5
+        current_temperature: 0.1
+    on_control:
+      - script.execute: send_pana
+
+# =====================================================================
+#  NÚT QUẠT / ĐÈN
+# =====================================================================
+button:
+  - platform: template
+    name: "Quạt - ON/SPEED"
+    on_press:
+      - remote_transmitter.transmit_raw:
+          transmitter_id: remote_transmitter_1
+          carrier_frequency: 38kHz
+          code: [1300, -450, 1300, -450, 480, -1250, 1300, -450, 1300, -450, 480, -1250, 480, -1250, 480, -1250, 480, -1250, 480, -1250, 1300, -450, 480]
+          repeat:
+            times: 8
+            wait_time: 7400us
+
+  - platform: template
+    name: "Quạt - OFF"
+    on_press:
+      - remote_transmitter.transmit_raw:
+          transmitter_id: remote_transmitter_1
+          carrier_frequency: 38kHz
+          code: [1300, -450, 1300, -450, 480, -1250, 1300, -450, 1300, -450, 480, -1250, 480, -1250, 480, -1250, 480, -1250, 480, -1250, 480, -1250, 1300]
+          repeat:
+            times: 8
+            wait_time: 7400us
+
+  - platform: template
+    name: "Quạt - Xoay"
+    on_press:
+      - remote_transmitter.transmit_raw:
+          transmitter_id: remote_transmitter_1
+          carrier_frequency: 38kHz
+          code: [1300, -450, 1300, -450, 480, -1250, 1300, -450, 1300, -450, 480, -1250, 480, -1250, 1300, -450, 480, -1250, 480, -1250, 480, -1250, 480]
+          repeat:
+            times: 8
+            wait_time: 7400us
+
+  - platform: template
+    name: "Đèn - ON/OFF"
+    on_press:
+      - remote_transmitter.transmit_nec:
+          transmitter_id: remote_transmitter_1
+          address: 0xDD22
+          command: 0xEE11
+
+  - platform: template
+    name: "Đèn - Sáng(+)"
+    on_press:
+      - remote_transmitter.transmit_nec:
+          transmitter_id: remote_transmitter_1
+          address: 0xDD22
+          command: 0xE718
+
+  - platform: template
+    name: "Đèn - Sáng(-)"
+    on_press:
+      - remote_transmitter.transmit_nec:
+          transmitter_id: remote_transmitter_1
+          address: 0xDD22
+          command: 0xE01F
+
+  - platform: template
+    name: "Đèn - Trắng"
+    on_press:
+      - remote_transmitter.transmit_nec:
+          transmitter_id: remote_transmitter_1
+          address: 0xDD22
+          command: 0xF807
+
+  - platform: template
+    name: "Đèn - Vàng"
+    on_press:
+      - remote_transmitter.transmit_nec:
+          transmitter_id: remote_transmitter_1
+          address: 0xDD22
+          command: 0xF00F
+
+  # --- Nút cấu hình LD2420 ---
+  - platform: ld2420
+    ld2420_id: radar
+    apply_config:
+      name: "LD2420 áp dụng cấu hình"
+    revert_config:
+      name: "LD2420 hoàn tác"
+    factory_reset:
+      name: "LD2420 khôi phục gốc"
+    restart_module:
+      name: "LD2420 khởi động lại"
+
+# =====================================================================
+#  CẢM BIẾN HIỆN DIỆN LD2420 (UART0 phần cứng, 115200 baud, nuôi 3.3V)
+#  Nối: LD2420 OT1 (TX) -> GPIO3 (RX0)
+#       LD2420 RX       -> GPIO1 (TX0)
+#       LD2420 3V3/GND  -> 3.3V / GND của mạch
+#  Lưu ý: khi nạp code qua cổng USB-Serial thì rút dây OT1 ra; nạp OTA thì không cần.
+# =====================================================================
+uart:
+  - id: uart_ld2420
+    tx_pin: GPIO1
+    rx_pin: GPIO3
+    baud_rate: 115200
+    parity: NONE
+    stop_bits: 1
+
+ld2420:
+  id: radar
+  uart_id: uart_ld2420
+
+binary_sensor:
+  - platform: ld2420
+    ld2420_id: radar
+    has_target:
+      id: co_nguoi
+      name: "Có người"
+      trigger_on_initial_state: true   # khởi động mà đã có người cũng nháy
+      on_press:
+        - if:
+            condition:
+              switch.is_on: led_presence_en
+            then:
+              - script.execute: blink_presence
+
+text_sensor:
+  - platform: ld2420
+    ld2420_id: radar
+    fw_version:
+      name: "LD2420 firmware"
+
+# Chế độ radar: Normal (chạy bình thường) / Calibrate (tự học nhiễu nền) / Simple.
+# HỌC LẠI: ra khỏi phòng (để quạt/rèm chạy như bình thường), chọn Calibrate,
+# chờ ~1-2 phút, rồi bấm "LD2420 áp dụng cấu hình" NGAY khi đang ở Calibrate
+# (nút này tự lưu và tự quay về Normal). KHÔNG chọn Normal trước: sẽ mất kết quả học.
+select:
+  - platform: ld2420
+    ld2420_id: radar
+    operating_mode:
+      name: "LD2420 chế độ"
+
+# Chỉnh trên HA (mục Cấu hình): thời gian giữ "Có người" sau khi người rời đi,
+# khoảng cách phát hiện, và ngưỡng từng cổng (mỗi cổng ~0.7 m).
+# Ngưỡng từng cổng: chọn số cổng ở "Chọn cổng" rồi đổi 2 ngưỡng; ngưỡng càng CAO càng KÉM nhạy.
+# "Hệ số hiệu chỉnh" dùng khi học lại: càng CAO thì ngưỡng học ra càng cao -> càng KÉM nhạy.
+# Đổi số xong bấm nút "LD2420 áp dụng cấu hình".
+number:
+  - platform: ld2420
+    ld2420_id: radar
+    presence_timeout:
+      name: "Thời gian giữ có người"
+    min_gate_distance:
+      name: "Cổng gần nhất"
+    max_gate_distance:
+      name: "Cổng xa nhất"
+    gate_select:
+      name: "Chọn cổng"
+    move_threshold:
+      name: "Ngưỡng chuyển động (vật lớn)"
+    still_threshold:
+      name: "Ngưỡng đứng yên (vật nhỏ)"
+    gate_move_sensitivity:
+      name: "Hệ số hiệu chỉnh chuyển động"
+    gate_still_sensitivity:
+      name: "Hệ số hiệu chỉnh đứng yên"
+
+  # Thanh kéo: khi có người thì đèn đỏ nháy mỗi xx giây/lần
+  - platform: template
+    id: blink_period
+    name: "Chu kỳ nháy đèn có người"
+    icon: mdi:timer-outline
+    unit_of_measurement: s
+    min_value: 1
+    max_value: 60
+    step: 1
+    initial_value: 2
+    mode: slider
+    optimistic: true
+    restore_value: true
+    entity_category: config
+
+switch:
+  # Công tắc bật/tắt đèn đỏ báo có người (nhớ trạng thái sau khi mất điện)
+  - platform: template
+    id: led_presence_en
+    name: "Đèn báo có người"
+    icon: mdi:led-on
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+    on_turn_off:
+      - script.stop: blink_presence
+      - output.turn_off: led_red
